@@ -1,0 +1,61 @@
+services:
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus-data:/prometheus
+    ports: ["9090:9090"]
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-storage:/var/lib/grafana
+    ports: ["3000:3000"]
+    depends_on: [prometheus]
+    restart: unless-stopped
+
+  # No GPU required. Emits the DCGM metric names with realistic shapes.
+  #   docker compose --profile demo up -d
+  mock-dcgm:
+    build: ./mock
+    profiles: [demo]
+    ports: ["9400:9400"]
+    restart: unless-stopped
+
+  # Real hardware. Needs the NVIDIA container runtime on the host.
+  #   docker compose --profile gpu up -d
+  # DCGM_EXPORTER_COLLECTORS must point at a field file that includes the
+  # DCGM_FI_PROF_* fields — the default set does not, and every panel in this
+  # project depends on them.
+  dcgm-exporter:
+    image: nvcr.io/nvidia/k8s/dcgm-exporter:3.3.9-3.6.1-ubuntu22.04
+    profiles: [gpu]
+    cap_add: [SYS_ADMIN]
+    environment:
+      DCGM_EXPORTER_COLLECTORS: /etc/dcgm-exporter/dcp-metrics-included.csv
+    ports: ["9400:9400"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
+volumes:
+  prometheus-data:
+  grafana-storage:
