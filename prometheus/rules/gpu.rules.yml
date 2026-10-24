@@ -1,0 +1,104 @@
+groups:
+  - name: gpu-truth
+    interval: 30s
+    rules:
+      # ---------------------------------------------------------------------
+      # The number everyone watches. DCGM_FI_DEV_GPU_UTIL is nvidia-smi's
+      # utilization.gpu: the share of time at least one kernel was resident.
+      # One kernel on one SM out of 108 reports 100%. Kept here only so the
+      # gap below can be computed against it.
+      # ---------------------------------------------------------------------
+      - record: gpu:utilization:ratio
+        expr: avg by (gpu, instance) (DCGM_FI_DEV_GPU_UTIL) / 100
+
+      # The numbers that actually say how much of the card is working.
+      - record: gpu:sm_active:ratio
+        expr: avg by (gpu, instance) (DCGM_FI_PROF_SM_ACTIVE)
+
+      - record: gpu:sm_occupancy:ratio
+        expr: avg by (gpu, instance) (DCGM_FI_PROF_SM_OCCUPANCY)
+
+      - record: gpu:tensor_active:ratio
+        expr: avg by (gpu, instance) (DCGM_FI_PROF_PIPE_TENSOR_ACTIVE)
+
+      - record: gpu:dram_active:ratio
+        expr: avg by (gpu, instance) (DCGM_FI_PROF_DRAM_ACTIVE)
+
+      - record: gpu:nvlink_bytes:rate5m
+        expr: >-
+          sum by (gpu, instance) (
+            rate(DCGM_FI_PROF_NVLINK_TX_BYTES[5m])
+            + rate(DCGM_FI_PROF_NVLINK_RX_BYTES[5m])
+          )
+
+      - record: gpu:memory_used:ratio
+        expr: >-
+          avg by (gpu, instance) (
+            DCGM_FI_DEV_FB_USED
+            / clamp_min(DCGM_FI_DEV_FB_USED + DCGM_FI_DEV_FB_FREE, 1)
+          )
+
+      # How far the headline number is from reality. This is the whole point.
+      - record: gpu:illusion_gap:ratio
+        expr: gpu:utilization:ratio - gpu:sm_active:ratio
+
+  - name: gpu-truth-alerts
+    rules:
+      # The expensive one. Dashboard pinned at 100%, card mostly idle, and
+      # somebody is about to raise a purchase request off that graph.
+      - alert: GPUBusyButIdle
+        expr: gpu:utilization:ratio > 0.9 and gpu:sm_active:ratio < 0.3
+        for: 15m
+        labels:
+          severity: warning
+          signal: capacity
+        annotations:
+          summary: "GPU {{ $labels.gpu }} looks saturated but most of it is idle"
+          description: >-
+            utilization.gpu is {{ $value | humanizePercentage }} while SM
+            activity is below 30%. utilization.gpu only means at least one
+            kernel was resident, so this reads as "out of capacity" when the
+            card has headroom. Check kernel launch patterns and batch size
+            before adding hardware.
+          runbook: docs/busy-but-idle.md
+
+      # Decode is memory-bandwidth bound. More SMs will not help here.
+      - alert: GPUMemoryBandwidthBound
+        expr: gpu:dram_active:ratio > 0.7 and gpu:sm_active:ratio < 0.4
+        for: 15m
+        labels:
+          severity: warning
+          signal: bottleneck
+        annotations:
+          summary: "GPU {{ $labels.gpu }} is memory-bandwidth bound, not compute bound"
+          description: >-
+            DRAM is active {{ $value | humanizePercentage }} of the time with
+            SMs under 40%. Buying more compute will not move this. Look at
+            quantisation, KV-cache layout, and batching instead.
+
+      # Paying for tensor cores and never touching them.
+      - alert: TensorCoresUnused
+        expr: gpu:sm_active:ratio > 0.5 and gpu:tensor_active:ratio < 0.05
+        for: 30m
+        labels:
+          severity: info
+          signal: efficiency
+        annotations:
+          summary: "GPU {{ $labels.gpu }} is busy without using tensor cores"
+          description: >-
+            SMs are working but the tensor pipe is effectively unused. Usually
+            an fp32 code path, an unfused kernel, or a model that never got
+            cast to fp16/bf16.
+
+      - alert: GPUMetricsMissing
+        expr: absent(DCGM_FI_DEV_GPU_UTIL) or absent(DCGM_FI_PROF_SM_ACTIVE)
+        for: 10m
+        labels:
+          severity: critical
+          signal: pipeline
+        annotations:
+          summary: "DCGM profiling metrics are not arriving"
+          description: >-
+            Either dcgm-exporter is down, or it is running without profiling
+            fields enabled. A dashboard with no data looks identical to a
+            dashboard with good data if nobody alerts on absence.
